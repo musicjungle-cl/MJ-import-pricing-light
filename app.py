@@ -1,103 +1,78 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
-import re
 import math
+import io
 
-# --- CONFIGURACIÓN DE PESOS ---
+# --- CONFIGURACIÓN ---
 RATIOS_PESO = {
-    "CD": 0.2, "CASSETTE": 0.25, "LP": 1.0, 
-    "2-LP": 1.9, "3-LP": 2.8, "2-CD": 0.4, 
-    "3-CD": 0.6, "3-DVD": 0.6
+    "LP": 1.0, "2-LP": 1.9, "3-LP": 2.8, 
+    "CD": 0.2, "2-CD": 0.4, "Cassette": 0.25
 }
 
 def redondear_900(valor):
     base = math.ceil(valor / 1000) * 1000
     return base - 100 if base - 100 >= valor else base + 900
 
-def extraer_datos_v2(file):
-    datos = []
-    flete_eur = 0.0
-    
-    with pdfplumber.open(file) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-            lines = page.extract_text().split('\n')
-            full_text += page.extract_text() + "\n"
-            
-            for line in lines:
-                # Buscamos líneas que empiecen con Barcode (13 dígitos) o el número de Bertus
-                # El patrón identifica: Barcode, Título, Config, Qty, Precio
-                match = re.search(r'(\d{13})\s+(.*?)\s+(LP|2-LP|3-LP|CD|2-CD|3-CD|3-DVD)\s+(\d+)\s+([\d,\.]+)', line)
-                
-                if match:
-                    barcode, title, config, qty, price = match.groups()
-                    datos.append({
-                        "Titulo": title.strip(),
-                        "Config": config,
-                        "Qty": int(qty),
-                        "Precio_EUR": float(price.replace('.', '').replace(',', '.')) / 100 if ',' in price and '.' in price else float(price.replace(',', '.'))
-                    })
+st.set_page_config(page_title="Calculadora Bertus", layout="wide")
+st.title("📀 Importación Directa por Copy-Paste")
 
-        # Extraer flete (Freight charges) [cite: 52]
-        flete_match = re.search(r"Freight charges\s+([\d,\.]+)", full_text)
-        if flete_match:
-            flete_eur = float(flete_match.group(1).replace('.', '').replace(',', '.'))
-            
-    return pd.DataFrame(datos), flete_eur
-
-# --- INTERFAZ ---
-st.set_page_config(page_title="Importación Bertus", layout="wide")
-st.title("📦 Calculadora de Importación Optimizada")
-
+# --- SIDEBAR: COSTOS ADUANA ---
 with st.sidebar:
-    st.header("1. Archivos y Valores")
-    uploaded_file = st.file_uploader("Factura Bertus (PDF)", type="pdf")
-    tasa_cambio = st.number_input("Tasa Cambio (EUR/CLP)", value=1000.0)
-    
-    st.header("2. Internación Chile (CLP)")
-    # Basado en los costos de tu imagen 2
+    st.header("Costos Chile (CLP)")
     iva_import = st.number_input("IVA Importación", value=436542.0)
     derechos = st.number_input("Derechos Aduana", value=130048.0)
     proc_entrada = st.number_input("Proceso de Entrada", value=157863.0)
-    iva_agente = st.number_input("IVA Agente Aduana", value=29994.0)
-
-if uploaded_file:
-    df, flete_detectado = extraer_datos_v2(uploaded_file)
+    iva_agente = st.number_input("IVA Agente", value=29994.0)
     
-    if not df.empty:
-        st.success(f"✅ {len(df)} productos detectados. Flete: €{flete_detectado}")
+    st.header("Logística")
+    flete_eur = st.number_input("Flete Europa (EUR)", value=376.76)
+    tasa_cambio = st.number_input("Tasa de Cambio", value=1000.0)
+
+# --- ÁREA DE PEGADO ---
+st.header("1. Pega tus datos")
+st.info("Copia las columnas desde Excel o Word y pégalas aquí abajo.")
+
+texto_pegado = st.text_area("Pega aquí (Artista-Título, Config, Qty, Precio)", height=150)
+
+if texto_pegado:
+    # Convertir el texto pegado en un DataFrame
+    # El separador '\t' funciona si vienes de Excel/Word
+    df = pd.read_csv(io.StringIO(texto_pegado), sep='\t', names=['Titulo', 'Config', 'Qty', 'Precio_EUR'], header=None)
+    
+    st.header("2. Revisa y Edita los datos")
+    st.warning("Si las columnas no se ven alineadas, ajusta los valores en la tabla de abajo:")
+    
+    # Permitimos editar por si el copy-paste falló en algo
+    df_editado = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+
+    if st.button("🚀 Calcular Precios Finales"):
+        # Cálculos de prorrateo
+        df_editado['Peso_U'] = df_editado['Config'].str.upper().map(RATIOS_PESO).fillna(1.0)
+        df_editado['Peso_T'] = df_editado['Peso_U'] * df_editado['Qty']
         
-        # --- CÁLCULOS ---
-        df['Peso_U'] = df['Config'].map(RATIOS_PESO).fillna(0.5)
-        df['Peso_Total_Linea'] = df['Peso_U'] * df['Qty']
+        # Transporte
+        flete_clp = flete_eur * tasa_cambio
+        df_editado['Flete_U'] = (df_editado['Peso_U'] / df_editado['Peso_T'].sum()) * flete_clp
         
-        # Prorrateo Transporte (por peso)
-        flete_clp = flete_detectado * tasa_cambio
-        df['Transp_U_CLP'] = (df['Peso_U'] / df['Peso_Total_Linea'].sum()) * flete_clp
+        # Impuestos (Proporcional al valor)
+        df_editado['Valor_Neto_U'] = (df_editado['Precio_EUR'] * tasa_cambio) + df_editado['Flete_U']
+        ratio_imp = (iva_import + derechos) / (df_editado['Valor_Neto_U'] * df_editado['Qty']).sum()
+        df_editado['Impuestos_U'] = df_editado['Valor_Neto_U'] * ratio_imp
         
-        # Prorrateo Impuestos (por valor FOB + Transp)
-        df['Valor_Aduana_U'] = (df['Precio_EUR'] * tasa_cambio) + df['Transp_U_CLP']
-        ratio_impuestos = (iva_import + derechos) / (df['Valor_Aduana_U'] * df['Qty']).sum()
-        df['Impuestos_U_CLP'] = df['Valor_Aduana_U'] * ratio_impuestos
+        # Gastos Fijos (Por unidad)
+        gastos_fijos_u = (proc_entrada + iva_agente) / df_editado['Qty'].sum()
         
-        # Prorrateo Gastos Fijos (por unidad)
-        gastos_fijos_u = (proc_entrada + iva_agente) / df['Qty'].sum()
+        # PRECIO FINAL
+        df_editado['COSTO_TOTAL'] = df_editado['Valor_Neto_U'] + df_editado['Impuestos_U'] + gastos_fijos_u
         
-        # COSTO FINAL Y PRECIOS
-        df['Costo_Landed'] = df['Valor_Aduana_U'] + df['Impuestos_U_CLP'] + gastos_fijos_u
-        df['Venta_1.5'] = (df['Costo_Landed'] * 1.5).apply(redondear_900)
-        df['Venta_1.7'] = (df['Costo_Landed'] * 1.7).apply(redondear_900)
-        df['Venta_1.9'] = (df['Costo_Landed'] * 1.9).apply(redondear_900)
+        # Sugerencias de Venta
+        df_editado['VENTA_1.5'] = (df_editado['COSTO_TOTAL'] * 1.5).apply(redondear_900)
+        df_editado['VENTA_1.7'] = (df_editado['COSTO_TOTAL'] * 1.7).apply(redondear_900)
+        df_editado['VENTA_1.9'] = (df_editado['COSTO_TOTAL'] * 1.9).apply(redondear_900)
         
-        st.dataframe(df[['Titulo', 'Config', 'Qty', 'Costo_Landed', 'Venta_1.5', 'Venta_1.7', 'Venta_1.9']].style.format(precision=0))
+        st.subheader("3. Resultados")
+        st.dataframe(df_editado[['Titulo', 'Config', 'Qty', 'COSTO_TOTAL', 'VENTA_1.5', 'VENTA_1.7', 'VENTA_1.9']].style.format(precision=0))
         
-        # RESUMEN
-        st.divider()
-        c1, c2, c3 = st.columns(3)
-        total_landed = (df['Costo_Landed'] * df['Qty']).sum()
-        c1.metric("Costo Total (Con IVA)", f"${total_landed:,.0f}")
-        c2.metric("Costo Total (Sin IVA)", f"${total_landed/1.19:,.0f}")
-        c3.metric("Flete Prorrateado", f"${flete_clp:,.0f} CLP")
-    else:
-        st.error("No se detectaron productos. Intenta subir el archivo nuevamente.")
+        # Resumen Final
+        total_v = (df_editado['COSTO_TOTAL'] * df_editado['Qty']).sum()
+        st.metric("Inversión Total Carga (CLP)", f"${total_v:,.0f}")
